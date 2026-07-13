@@ -14,14 +14,14 @@ from src.gp import (
     marginal_nll,
 )
 from src.grid import image, make_grid, nearest_grid_index
-from src.kernels import density_matern_kernel, kernel_to_correlation, rbf_kernel_2d
+from src.kernels import density_heat_kernel, kernel_to_correlation, rbf_kernel_2d
 from src.metrics import (
     average_pair_correlation,
     average_pair_distance,
     average_pair_label_difference,
     evaluate_predictions,
 )
-from src.training import fit_density_matern_kernel, fit_rbf_kernel_2d
+from src.training import fit_density_heat_kernel_multistart, fit_rbf_kernel_2d
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -297,7 +297,7 @@ def plot_results(
 def print_diagnostics(diagnostics):
     print("\nHyperparameters")
     print(
-        f"  dGP kappa={diagnostics['density_kappa']:.4f}, "
+        f"  dGP heat tau={diagnostics['density_tau']:.4f}, "
         f"sigma={diagnostics['density_sigma']:.4f}, loss={diagnostics['density_loss']:.4f}"
     )
     print(
@@ -386,7 +386,7 @@ def main():
     noise_var = NOISE_SD**2
     y_train = y_true[idx_train] + NOISE_SD * torch.randn(len(idx_train), dtype=dtype, device=device)
 
-    kappa_raw, sigma_density_raw, density_loss = fit_density_matern_kernel(
+    tau_raw, sigma_density_raw, density_loss = fit_density_heat_kernel_multistart(
         y_train,
         eigenvalues,
         eigenvectors[idx_train],
@@ -403,7 +403,7 @@ def main():
     )
 
     with torch.no_grad():
-        kernel_density = density_matern_kernel(kappa_raw, sigma_density_raw, eigenvalues, eigenvectors)
+        kernel_density = density_heat_kernel(tau_raw, sigma_density_raw, eigenvalues, eigenvectors)
         kernel_rbf = rbf_kernel_2d(lengthscale_raw, sigma_rbf_raw, points)
 
         mean_density, var_density = gp_posterior(kernel_density, idx_train, y_train, noise_var)
@@ -454,7 +454,7 @@ def main():
         )
 
         diagnostics = {
-            "density_kappa": float(F.softplus(kappa_raw).cpu()),
+            "density_tau": float(F.softplus(tau_raw).cpu()),
             "density_sigma": float(F.softplus(sigma_density_raw).cpu()),
             "density_loss": density_loss,
             "rbf_lengthscale": float(F.softplus(lengthscale_raw).cpu()),

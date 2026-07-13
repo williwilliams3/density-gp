@@ -23,7 +23,15 @@ def density_heat_kernel(tau_raw, sigma_f_raw, eigenvalues, eigenvectors, amp=Non
     return (sigma_f**2) * (eigenvectors * weights.unsqueeze(0)) @ eigenvectors.T
 
 
-def density_matern_kernel(kappa_raw, sigma_f_raw, eigenvalues, eigenvectors, amp=None, alpha=1.5):
+def density_matern_kernel(
+    kappa_raw,
+    sigma_f_raw,
+    eigenvalues,
+    eigenvectors,
+    amp=None,
+    alpha=1.5,
+    normalize=True,
+):
     kappa = F.softplus(kappa_raw)
     sigma_f = F.softplus(sigma_f_raw)
     weights = ((kappa**2) / (kappa**2 + eigenvalues)).pow(alpha)
@@ -32,7 +40,8 @@ def density_matern_kernel(kappa_raw, sigma_f_raw, eigenvalues, eigenvectors, amp
         eigenvectors = amp.unsqueeze(1) * eigenvectors
 
     base_kernel = (eigenvectors * weights.unsqueeze(0)) @ eigenvectors.T
-    base_kernel = base_kernel / torch.diag(base_kernel).mean().clamp_min(1e-12)
+    if normalize:
+        base_kernel = base_kernel / torch.diag(base_kernel).mean().clamp_min(1e-12)
     return (sigma_f**2) * base_kernel
 
 

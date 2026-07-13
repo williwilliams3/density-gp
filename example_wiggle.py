@@ -7,12 +7,14 @@ import torch.nn.functional as F
 
 from src.densities import build_notched_gaussian_density, sample_notched_gaussian_density
 from src.fem import weighted_laplacian_eigendecomposition
-from src.gp import gp_posterior, neg_mll_loss
+from src.gp import gp_posterior
 from src.kernels import (
     density_amplitude,
+    density_matern_kernel,
     kernel_to_correlation,
     rbf_kernel,
 )
+from src.training import fit_density_matern_kernel, fit_rbf_kernel_multistart
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -22,6 +24,7 @@ torch.manual_seed(23)
 USE_DENSITY_AMPLITUDE = False
 VALLEY_WIDTH = 0.35
 VALLEY_REGION = 0.65
+N_LOW_DENSITY_LABELS = 3
 
 
 def low_density_oscillation_target(x):
@@ -35,127 +38,15 @@ def rmse(pred, truth, mask):
     return torch.sqrt(torch.mean((pred[mask] - truth[mask]) ** 2))
 
 
-def density_matern_kernel(kappa_raw, sigma_f_raw, eigenvalues, eigenvectors, amp=None, alpha=1.5):
-    kappa = F.softplus(kappa_raw)
-    sigma_f = F.softplus(sigma_f_raw)
-    weights = ((kappa**2) / (kappa**2 + eigenvalues)).pow(alpha)
-
-    if amp is not None:
-        eigenvectors = amp.unsqueeze(1) * eigenvectors
-
-    return (sigma_f**2) * (eigenvectors * weights.unsqueeze(0)) @ eigenvectors.T
+def marginal_nll(truth, mean, var, mask):
+    pred_var = torch.clamp(var[mask], min=1e-8)
+    return 0.5 * (
+        torch.log(2.0 * math.pi * pred_var)
+        + (truth[mask] - mean[mask]).pow(2) / pred_var
+    ).mean()
 
 
-def fit_density_matern_kernel(
-    y_train,
-    eigenvalues,
-    train_eigenvectors,
-    train_amp,
-    noise_var,
-    alpha=1.5,
-    kappa_inits=(-2.0, 0.0),
-    steps=500,
-    lr=0.05,
-):
-    best = None
-
-    for kappa_init in kappa_inits:
-        kappa_raw = torch.tensor(
-            kappa_init,
-            requires_grad=True,
-            dtype=y_train.dtype,
-            device=y_train.device,
-        )
-        sigma_raw = torch.tensor(
-            0.0,
-            requires_grad=True,
-            dtype=y_train.dtype,
-            device=y_train.device,
-        )
-        opt = torch.optim.Adam([kappa_raw, sigma_raw], lr=lr)
-
-        for _ in range(steps):
-            opt.zero_grad()
-            kernel = density_matern_kernel(
-                kappa_raw,
-                sigma_raw,
-                eigenvalues,
-                train_eigenvectors,
-                train_amp,
-                alpha=alpha,
-            )
-            loss = neg_mll_loss(y_train, kernel, noise_var)
-            loss.backward()
-            opt.step()
-
-        with torch.no_grad():
-            kernel = density_matern_kernel(
-                kappa_raw,
-                sigma_raw,
-                eigenvalues,
-                train_eigenvectors,
-                train_amp,
-                alpha=alpha,
-            )
-            final_loss = float(neg_mll_loss(y_train, kernel, noise_var).cpu())
-
-        if best is None or final_loss < best[0]:
-            best = (
-                final_loss,
-                kappa_raw.detach().clone(),
-                sigma_raw.detach().clone(),
-            )
-
-    return best[1], best[2], best[0]
-
-
-def fit_rbf_kernel_multistart(
-    y_train,
-    x_train,
-    noise_var,
-    lengthscale_inits=(-5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0),
-    steps=500,
-    lr=0.05,
-):
-    best = None
-
-    for lengthscale_init in lengthscale_inits:
-        lengthscale_raw = torch.tensor(
-            lengthscale_init,
-            requires_grad=True,
-            dtype=y_train.dtype,
-            device=y_train.device,
-        )
-        sigma_raw = torch.tensor(
-            0.0,
-            requires_grad=True,
-            dtype=y_train.dtype,
-            device=y_train.device,
-        )
-        opt = torch.optim.Adam([lengthscale_raw, sigma_raw], lr=lr)
-
-        for _ in range(steps):
-            opt.zero_grad()
-            kernel = rbf_kernel(lengthscale_raw, sigma_raw, x_train)
-            loss = neg_mll_loss(y_train, kernel, noise_var)
-            loss.backward()
-            opt.step()
-
-        with torch.no_grad():
-            kernel = rbf_kernel(lengthscale_raw, sigma_raw, x_train)
-            final_loss = float(neg_mll_loss(y_train, kernel, noise_var).cpu())
-
-        if best is None or final_loss < best[0]:
-            best = (
-                final_loss,
-                lengthscale_raw.detach().clone(),
-                sigma_raw.detach().clone(),
-            )
-
-    return best[1], best[2], best[0]
-
-
-def plot_example_4(
+def plot_example_wiggle(
     *,
     output_path,
     x_grid,
@@ -201,7 +92,7 @@ def plot_example_4(
         alpha=0.12,
         label="low-density oscillatory region",
     )
-    axs[0, 0].set_title("Labels Include the Low-Density Region")
+    axs[0, 0].set_title("Fewer Labels in the Low-Density Region")
     axs[0, 0].legend()
 
     axs[0, 1].plot(xg, f_true.detach().cpu().numpy(), "k:", lw=2, label="true function")
@@ -213,10 +104,7 @@ def plot_example_4(
         label="training labels",
     )
     axs[0, 1].axvspan(-VALLEY_REGION, VALLEY_REGION, color="orange", alpha=0.12)
-    axs[0, 1].text(-2.7, 0.2, "smooth high-density mode", fontsize=10)
-    axs[0, 1].text(-0.58, 1.12, "oscillatory\nlow density", fontsize=10)
-    axs[0, 1].text(1.0, 0.0, "smooth high-density mode", fontsize=10)
-    axs[0, 1].set_title("Smooth in Modes, Oscillatory in the Valley")
+    axs[0, 1].set_title("Oscillatory in the Valley")
     axs[0, 1].legend()
 
     axs[1, 0].plot(
@@ -282,8 +170,8 @@ def plot_example_4(
     axs[1, 1].legend()
 
     metric_text = (
-        f"RMSE high-density: dGP={metrics['density_high']:.3f}, RBF={metrics['rbf_high']:.3f}\n"
-        f"RMSE low-density:  dGP={metrics['density_low']:.3f}, RBF={metrics['rbf_low']:.3f}"
+        f"NLL high-density: dGP={metrics['density_high_nll']:.3f}, RBF={metrics['rbf_high_nll']:.3f}\n"
+        f"NLL low-density:  dGP={metrics['density_low_nll']:.3f}, RBF={metrics['rbf_low_nll']:.3f}"
     )
     axs[1, 1].text(
         0.02,
@@ -327,7 +215,7 @@ def main():
     low_density_labels = torch.linspace(
         -0.60,
         0.60,
-        27,
+        N_LOW_DENSITY_LABELS,
         dtype=dtype,
         device=device,
     )
@@ -348,8 +236,13 @@ def main():
         y_train=y_train,
         eigenvalues=eigenvalues,
         train_eigenvectors=eigenvectors[idx_train],
-        train_amp=amp_vals[idx_train],
         noise_var=noise_var,
+        train_amp=amp_vals[idx_train],
+        kappa_inits=(-2.0, 0.0),
+        sigma_inits=(0.0,),
+        steps=500,
+        lr=0.05,
+        normalize=False,
     )
     lengthscale_raw, sigma_rbf_raw, rbf_loss = fit_rbf_kernel_multistart(
         y_train=y_train,
@@ -364,6 +257,7 @@ def main():
             eigenvalues,
             eigenvectors,
             amp_vals,
+            normalize=False,
         )
         kernel_rbf = rbf_kernel(lengthscale_raw, sigma_rbf_raw, x_grid)
 
@@ -375,11 +269,19 @@ def main():
 
         high_density_mask = torch.abs(x_grid) >= 0.85
         low_density_mask = torch.abs(x_grid) <= VALLEY_REGION
+        pred_var_density = var_density + noise_var
+        pred_var_rbf = var_rbf + noise_var
         metrics = {
-            "density_high": float(rmse(mu_density, f_true, high_density_mask).cpu()),
-            "rbf_high": float(rmse(mu_rbf, f_true, high_density_mask).cpu()),
-            "density_low": float(rmse(mu_density, f_true, low_density_mask).cpu()),
-            "rbf_low": float(rmse(mu_rbf, f_true, low_density_mask).cpu()),
+            "density_high_rmse": float(rmse(mu_density, f_true, high_density_mask).cpu()),
+            "rbf_high_rmse": float(rmse(mu_rbf, f_true, high_density_mask).cpu()),
+            "density_low_rmse": float(rmse(mu_density, f_true, low_density_mask).cpu()),
+            "rbf_low_rmse": float(rmse(mu_rbf, f_true, low_density_mask).cpu()),
+            "density_high_nll": float(
+                marginal_nll(f_true, mu_density, pred_var_density, high_density_mask).cpu()
+            ),
+            "rbf_high_nll": float(marginal_nll(f_true, mu_rbf, pred_var_rbf, high_density_mask).cpu()),
+            "density_low_nll": float(marginal_nll(f_true, mu_density, pred_var_density, low_density_mask).cpu()),
+            "rbf_low_nll": float(marginal_nll(f_true, mu_rbf, pred_var_rbf, low_density_mask).cpu()),
         }
 
         idx_high_ref = torch.argmin(torch.abs(x_grid - 1.45))
@@ -401,10 +303,34 @@ def main():
             "loss:",
             rbf_loss,
         )
-        print("RMSE metrics:", metrics)
+        print(
+            "RMSE metrics:",
+            {
+                key: value
+                for key, value in metrics.items()
+                if key.endswith("_rmse")
+            },
+        )
+        print(
+            "NLL metrics:",
+            {
+                key: value
+                for key, value in metrics.items()
+                if key.endswith("_nll")
+            },
+        )
+        print(
+            "Training labels:",
+            {
+                "left_high_density": len(high_density_labels),
+                "low_density": len(low_density_labels),
+                "right_high_density": len(high_density_labels),
+                "total": len(x_train),
+            },
+        )
 
     output_path = Path(__file__).resolve().parent / "figs" / "example_wiggle.png"
-    plot_example_4(
+    plot_example_wiggle(
         output_path=output_path,
         x_grid=x_grid,
         data=data,

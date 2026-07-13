@@ -31,7 +31,7 @@ def two_regime_target(x):
     return torch.where(x < 0.0, left, right)
 
 
-def plot_example_2(
+def plot_example_step(
     *,
     output_path,
     x_grid,
@@ -230,7 +230,7 @@ def main():
         )
 
     output_path = Path(__file__).resolve().parent / "figs" / "example_step.png"
-    plot_example_2(
+    plot_example_step(
         output_path=output_path,
         x_grid=x_grid,
         data=data,
