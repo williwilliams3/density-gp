@@ -1,0 +1,7 @@
+torch
+numpy
+scipy
+matplotlib
+scikit-fem
+gpytorch>=1.15,<1.16
+linear-operator>=0.6,<0.7

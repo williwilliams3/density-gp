@@ -4,24 +4,23 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from src.fem import weighted_laplacian_eigendecomposition_2d
 from src.gp import (
+    dense_prior_covariance,
     gaussian_nll,
-    gp_posterior,
-    gp_posterior_subset,
     marginal_nll,
+    predict_exact_gp,
 )
 from src.grid import image, make_grid, nearest_grid_index
-from src.kernels import density_heat_kernel, kernel_to_correlation, rbf_kernel_2d
+from src.kernels import kernel_to_correlation
 from src.metrics import (
     average_pair_correlation,
     average_pair_distance,
     average_pair_label_difference,
     evaluate_predictions,
 )
-from src.training import fit_density_heat_kernel_multistart, fit_rbf_kernel_2d
+from src.training import fit_density_gp, fit_euclidean_gp
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -386,42 +385,58 @@ def main():
     noise_var = NOISE_SD**2
     y_train = y_true[idx_train] + NOISE_SD * torch.randn(len(idx_train), dtype=dtype, device=device)
 
-    tau_raw, sigma_density_raw, density_loss = fit_density_heat_kernel_multistart(
-        y_train,
-        eigenvalues,
-        eigenvectors[idx_train],
-        noise_var,
+    grid_indices = torch.arange(len(points), dtype=dtype, device=device).unsqueeze(-1)
+    density_fit = fit_density_gp(
+        y_train=y_train,
+        train_grid_indices=idx_train,
+        noise_var=noise_var,
+        eigenvalues=eigenvalues,
+        eigenvectors=eigenvectors,
+        kind="heat",
+        spectral_raw_inits=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0),
+        sigma_raw_inits=(-1.0, 0.0, 1.0),
         steps=300,
         lr=0.05,
     )
-    lengthscale_raw, sigma_rbf_raw, rbf_loss = fit_rbf_kernel_2d(
-        y_train,
-        points[idx_train],
-        noise_var,
+    rbf_fit = fit_euclidean_gp(
+        y_train=y_train,
+        x_train=points[idx_train],
+        noise_var=noise_var,
+        kind="rbf",
+        lengthscale_raw_inits=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0),
+        sigma_raw_inits=(-1.0, 0.0, 1.0),
         steps=300,
         lr=0.05,
     )
+
+    density_model = density_fit.model
+    rbf_model = rbf_fit.model
+    density_prediction = predict_exact_gp(density_model, grid_indices, noise_var)
+    rbf_prediction = predict_exact_gp(rbf_model, points, noise_var)
+    density_test_prediction = predict_exact_gp(
+        density_model,
+        grid_indices[idx_test],
+        noise_var,
+        full_covariance=True,
+    )
+    rbf_test_prediction = predict_exact_gp(
+        rbf_model,
+        points[idx_test],
+        noise_var,
+        full_covariance=True,
+    )
+    kernel_density = dense_prior_covariance(density_model, grid_indices)
+    kernel_rbf = dense_prior_covariance(rbf_model, points)
 
     with torch.no_grad():
-        kernel_density = density_heat_kernel(tau_raw, sigma_density_raw, eigenvalues, eigenvectors)
-        kernel_rbf = rbf_kernel_2d(lengthscale_raw, sigma_rbf_raw, points)
-
-        mean_density, var_density = gp_posterior(kernel_density, idx_train, y_train, noise_var)
-        mean_rbf, var_rbf = gp_posterior(kernel_rbf, idx_train, y_train, noise_var)
-        test_mean_density, test_cov_density = gp_posterior_subset(
-            kernel_density,
-            idx_train,
-            y_train,
-            idx_test,
-            noise_var,
-        )
-        test_mean_rbf, test_cov_rbf = gp_posterior_subset(
-            kernel_rbf,
-            idx_train,
-            y_train,
-            idx_test,
-            noise_var,
-        )
+        mean_density = density_prediction.latent_mean
+        var_density = density_prediction.latent_variance
+        mean_rbf = rbf_prediction.latent_mean
+        var_rbf = rbf_prediction.latent_variance
+        test_mean_density = density_test_prediction.latent_mean
+        test_cov_density = density_test_prediction.latent_covariance
+        test_mean_rbf = rbf_test_prediction.latent_mean
+        test_cov_rbf = rbf_test_prediction.latent_covariance
         y_test = y_true[idx_test]
         density_test_joint_nll = gaussian_nll(y_test, test_mean_density, test_cov_density, noise_var)
         rbf_test_joint_nll = gaussian_nll(y_test, test_mean_rbf, test_cov_rbf, noise_var)
@@ -454,12 +469,12 @@ def main():
         )
 
         diagnostics = {
-            "density_tau": float(F.softplus(tau_raw).cpu()),
-            "density_sigma": float(F.softplus(sigma_density_raw).cpu()),
-            "density_loss": density_loss,
-            "rbf_lengthscale": float(F.softplus(lengthscale_raw).cpu()),
-            "rbf_sigma": float(F.softplus(sigma_rbf_raw).cpu()),
-            "rbf_loss": rbf_loss,
+            "density_tau": float(density_model.covar_module.base_kernel.tau.cpu()),
+            "density_sigma": float(density_model.covar_module.outputscale.sqrt().cpu()),
+            "density_loss": density_fit.total_negative_mll,
+            "rbf_lengthscale": float(rbf_model.covar_module.base_kernel.lengthscale.cpu()),
+            "rbf_sigma": float(rbf_model.covar_module.outputscale.sqrt().cpu()),
+            "rbf_loss": rbf_fit.total_negative_mll,
             "density_min": float(p_vals.min()),
             "density_max": float(p_vals.max()),
             "n_tube_test": int(test_tube_mask.sum().cpu()),
@@ -480,8 +495,18 @@ def main():
             "rbf_test_joint_nll_per_point": float((rbf_test_joint_nll / len(idx_test)).cpu()),
             "density_test_marginal_nll": float(density_test_marginal_nll.cpu()),
             "rbf_test_marginal_nll": float(rbf_test_marginal_nll.cpu()),
-            "density": evaluate_predictions(y_true, mean_density, var_density + noise_var, masks),
-            "rbf": evaluate_predictions(y_true, mean_rbf, var_rbf + noise_var, masks),
+            "density": evaluate_predictions(
+                y_true,
+                mean_density,
+                density_prediction.observed_variance,
+                masks,
+            ),
+            "rbf": evaluate_predictions(
+                y_true,
+                mean_rbf,
+                rbf_prediction.observed_variance,
+                masks,
+            ),
         }
 
     output_path = Path(__file__).resolve().parent / "figs" / "example_spiral.png"

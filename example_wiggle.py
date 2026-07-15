@@ -3,18 +3,15 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
-import torch.nn.functional as F
 
 from src.densities import build_notched_gaussian_density, sample_notched_gaussian_density
 from src.fem import weighted_laplacian_eigendecomposition
-from src.gp import gp_posterior
+from src.gp import dense_prior_covariance, predict_exact_gp
 from src.kernels import (
     density_amplitude,
-    density_matern_kernel,
     kernel_to_correlation,
-    rbf_kernel,
 )
-from src.training import fit_density_matern_kernel, fit_rbf_kernel_multistart
+from src.training import fit_density_gp, fit_euclidean_gp
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -232,45 +229,51 @@ def main():
     noise_var = 0.04**2
     y_train = f_true[idx_train] + math.sqrt(noise_var) * torch.randn_like(x_train)
 
-    kappa_raw, sigma_density_raw, density_loss = fit_density_matern_kernel(
+    grid_indices = torch.arange(len(x_grid), dtype=dtype, device=device).unsqueeze(-1)
+    density_fit = fit_density_gp(
         y_train=y_train,
-        eigenvalues=eigenvalues,
-        train_eigenvectors=eigenvectors[idx_train],
+        train_grid_indices=idx_train,
         noise_var=noise_var,
-        train_amp=amp_vals[idx_train],
-        kappa_inits=(-2.0, 0.0),
-        sigma_inits=(0.0,),
+        eigenvalues=eigenvalues,
+        eigenvectors=eigenvectors,
+        kind="matern",
+        amplitude=amp_vals,
+        spectral_raw_inits=(-2.0, 0.0),
+        sigma_raw_inits=(0.0,),
         steps=500,
         lr=0.05,
-        normalize=False,
     )
-    lengthscale_raw, sigma_rbf_raw, rbf_loss = fit_rbf_kernel_multistart(
+    rbf_fit = fit_euclidean_gp(
         y_train=y_train,
         x_train=x_train,
         noise_var=noise_var,
+        kind="rbf",
+        lengthscale_raw_inits=(-5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0),
+        sigma_raw_inits=(0.0,),
+        steps=500,
+        lr=0.05,
     )
 
-    with torch.no_grad():
-        kernel_density = density_matern_kernel(
-            kappa_raw,
-            sigma_density_raw,
-            eigenvalues,
-            eigenvectors,
-            amp_vals,
-            normalize=False,
-        )
-        kernel_rbf = rbf_kernel(lengthscale_raw, sigma_rbf_raw, x_grid)
+    density_model = density_fit.model
+    rbf_model = rbf_fit.model
+    density_prediction = predict_exact_gp(density_model, grid_indices, noise_var)
+    rbf_prediction = predict_exact_gp(rbf_model, x_grid, noise_var)
+    kernel_density = dense_prior_covariance(density_model, grid_indices)
+    kernel_rbf = dense_prior_covariance(rbf_model, x_grid)
 
+    with torch.no_grad():
         corr_density = kernel_to_correlation(kernel_density)
         corr_rbf = kernel_to_correlation(kernel_rbf)
 
-        mu_density, var_density = gp_posterior(kernel_density, idx_train, y_train, noise_var)
-        mu_rbf, var_rbf = gp_posterior(kernel_rbf, idx_train, y_train, noise_var)
+        mu_density = density_prediction.latent_mean
+        var_density = density_prediction.latent_variance
+        mu_rbf = rbf_prediction.latent_mean
+        var_rbf = rbf_prediction.latent_variance
 
         high_density_mask = torch.abs(x_grid) >= 0.85
         low_density_mask = torch.abs(x_grid) <= VALLEY_REGION
-        pred_var_density = var_density + noise_var
-        pred_var_rbf = var_rbf + noise_var
+        pred_var_density = density_prediction.observed_variance
+        pred_var_rbf = rbf_prediction.observed_variance
         metrics = {
             "density_high_rmse": float(rmse(mu_density, f_true, high_density_mask).cpu()),
             "rbf_high_rmse": float(rmse(mu_rbf, f_true, high_density_mask).cpu()),
@@ -289,19 +292,19 @@ def main():
 
         print(
             "density Matérn GP kappa:",
-            float(F.softplus(kappa_raw).cpu()),
+            float(density_model.covar_module.base_kernel.kappa.cpu()),
             "sigma:",
-            float(F.softplus(sigma_density_raw).cpu()),
+            float(density_model.covar_module.outputscale.sqrt().cpu()),
             "loss:",
-            density_loss,
+            density_fit.total_negative_mll,
         )
         print(
             "RBF lengthscale:",
-            float(F.softplus(lengthscale_raw).cpu()),
+            float(rbf_model.covar_module.base_kernel.lengthscale.cpu()),
             "sigma:",
-            float(F.softplus(sigma_rbf_raw).cpu()),
+            float(rbf_model.covar_module.outputscale.sqrt().cpu()),
             "loss:",
-            rbf_loss,
+            rbf_fit.total_negative_mll,
         )
         print(
             "RMSE metrics:",

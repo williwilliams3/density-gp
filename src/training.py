@@ -1,263 +1,145 @@
+from dataclasses import dataclass
+from itertools import product
+
+import gpytorch
 import torch
+import torch.nn.functional as F
 
-from .gp import neg_mll_loss
-from .kernels import density_heat_kernel, density_matern_kernel, rbf_kernel, rbf_kernel_2d
+from .gp import (
+    ExactGPModel,
+    build_euclidean_kernel,
+    canonicalize_inputs,
+    fixed_noise_likelihood,
+)
+from .kernels import build_grid_density_kernel
 
 
-def fit_density_heat_kernel(
+@dataclass(frozen=True)
+class GPFitResult:
+    model: gpytorch.models.ExactGP
+    total_negative_mll: float
+
+
+def fit_exact_gp_multistart(model_factory, starts, *, steps=300, lr=0.1):
+    """Fit models built by ``model_factory`` and retain the best final state.
+
+    ``model_factory(start)`` owns kernel-specific initialization. This keeps the
+    optimization loop shared without coupling it to a particular kernel's
+    constrained parameter names.
+    """
+    best = None
+    starts = tuple(starts)
+    if not starts:
+        raise ValueError("At least one initialization is required")
+
+    for start in starts:
+        model = model_factory(start)
+        model.train()
+        model.likelihood.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(model.likelihood, model)
+
+        for _ in range(steps):
+            optimizer.zero_grad()
+            output = model(*model.train_inputs)
+            loss = -mll(output, model.train_targets)
+            loss.backward()
+            optimizer.step()
+
+        model.train()
+        model.likelihood.train()
+        with torch.no_grad():
+            output = model(*model.train_inputs)
+            total_negative_mll = float(
+                (-mll(output, model.train_targets) * len(model.train_targets)).cpu()
+            )
+
+        if best is None or total_negative_mll < best.total_negative_mll:
+            best = GPFitResult(model=model, total_negative_mll=total_negative_mll)
+
+    return best
+
+
+def fit_euclidean_gp(
     y_train,
-    eigenvalues,
-    train_eigenvectors,
-    train_amp,
+    x_train,
     noise_var,
+    *,
+    kind="rbf",
+    lengthscale_raw_inits=(0.0,),
+    sigma_raw_inits=(0.0,),
     steps=300,
     lr=0.1,
+    ard=False,
+    nu=1.5,
 ):
-    tau_raw = torch.tensor(0.0, requires_grad=True, dtype=y_train.dtype, device=y_train.device)
-    sigma_raw = torch.tensor(0.0, requires_grad=True, dtype=y_train.dtype, device=y_train.device)
-    opt = torch.optim.Adam([tau_raw, sigma_raw], lr=lr)
+    """Fit a Euclidean exact GP for inputs of any spatial dimension."""
+    x_train = canonicalize_inputs(x_train)
+    starts = tuple(product(lengthscale_raw_inits, sigma_raw_inits))
 
-    for _ in range(steps):
-        opt.zero_grad()
-        kernel = density_heat_kernel(
-            tau_raw,
-            sigma_raw,
-            eigenvalues,
-            train_eigenvectors,
-            train_amp,
+    def model_factory(start):
+        lengthscale_raw, sigma_raw = start
+        covariance_module = build_euclidean_kernel(
+            kind,
+            num_dims=x_train.shape[-1],
+            ard=ard,
+            nu=nu,
+        ).to(dtype=y_train.dtype, device=y_train.device)
+        covariance_module.base_kernel.lengthscale = F.softplus(
+            torch.as_tensor(lengthscale_raw, dtype=y_train.dtype, device=y_train.device)
         )
-        loss = neg_mll_loss(y_train, kernel, noise_var)
-        loss.backward()
-        opt.step()
+        covariance_module.outputscale = F.softplus(
+            torch.as_tensor(sigma_raw, dtype=y_train.dtype, device=y_train.device)
+        ).square()
+        likelihood = fixed_noise_likelihood(y_train, noise_var)
+        return ExactGPModel(x_train, y_train, likelihood, covariance_module)
 
-    return tau_raw, sigma_raw
+    return fit_exact_gp_multistart(model_factory, starts, steps=steps, lr=lr)
 
 
-def fit_density_heat_kernel_multistart(
+def fit_density_gp(
     y_train,
+    train_grid_indices,
+    noise_var,
     eigenvalues,
-    train_eigenvectors,
-    noise_var,
-    train_amp=None,
-    tau_inits=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0),
-    sigma_inits=(-1.0, 0.0, 1.0),
-    steps=350,
-    lr=0.05,
-):
-    best = None
-
-    for tau_init in tau_inits:
-        for sigma_init in sigma_inits:
-            tau_raw = torch.tensor(
-                tau_init,
-                dtype=y_train.dtype,
-                device=y_train.device,
-                requires_grad=True,
-            )
-            sigma_raw = torch.tensor(
-                sigma_init,
-                dtype=y_train.dtype,
-                device=y_train.device,
-                requires_grad=True,
-            )
-            opt = torch.optim.Adam([tau_raw, sigma_raw], lr=lr)
-
-            for _ in range(steps):
-                opt.zero_grad()
-                kernel = density_heat_kernel(
-                    tau_raw,
-                    sigma_raw,
-                    eigenvalues,
-                    train_eigenvectors,
-                    train_amp,
-                )
-                loss = neg_mll_loss(y_train, kernel, noise_var)
-                loss.backward()
-                opt.step()
-
-            with torch.no_grad():
-                kernel = density_heat_kernel(
-                    tau_raw,
-                    sigma_raw,
-                    eigenvalues,
-                    train_eigenvectors,
-                    train_amp,
-                )
-                final_loss = float(neg_mll_loss(y_train, kernel, noise_var).cpu())
-
-            if best is None or final_loss < best[0]:
-                best = (final_loss, tau_raw.detach().clone(), sigma_raw.detach().clone())
-
-    return best[1], best[2], best[0]
-
-
-def fit_rbf_kernel(y_train, x_train, noise_var, steps=300, lr=0.1):
-    lengthscale_raw = torch.tensor(
-        0.0,
-        requires_grad=True,
-        dtype=y_train.dtype,
-        device=y_train.device,
-    )
-    sigma_raw = torch.tensor(0.0, requires_grad=True, dtype=y_train.dtype, device=y_train.device)
-    opt = torch.optim.Adam([lengthscale_raw, sigma_raw], lr=lr)
-
-    for _ in range(steps):
-        opt.zero_grad()
-        kernel = rbf_kernel(lengthscale_raw, sigma_raw, x_train)
-        loss = neg_mll_loss(y_train, kernel, noise_var)
-        loss.backward()
-        opt.step()
-
-    return lengthscale_raw, sigma_raw
-
-
-def fit_rbf_kernel_multistart(
-    y_train,
-    x_train,
-    noise_var,
-    lengthscale_inits=(-5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0),
-    sigma_inits=(0.0,),
-    steps=500,
-    lr=0.05,
-):
-    best = None
-
-    for lengthscale_init in lengthscale_inits:
-        for sigma_init in sigma_inits:
-            lengthscale_raw = torch.tensor(
-                lengthscale_init,
-                dtype=y_train.dtype,
-                device=y_train.device,
-                requires_grad=True,
-            )
-            sigma_raw = torch.tensor(
-                sigma_init,
-                dtype=y_train.dtype,
-                device=y_train.device,
-                requires_grad=True,
-            )
-            opt = torch.optim.Adam([lengthscale_raw, sigma_raw], lr=lr)
-
-            for _ in range(steps):
-                opt.zero_grad()
-                kernel = rbf_kernel(lengthscale_raw, sigma_raw, x_train)
-                loss = neg_mll_loss(y_train, kernel, noise_var)
-                loss.backward()
-                opt.step()
-
-            with torch.no_grad():
-                kernel = rbf_kernel(lengthscale_raw, sigma_raw, x_train)
-                final_loss = float(neg_mll_loss(y_train, kernel, noise_var).cpu())
-
-            if best is None or final_loss < best[0]:
-                best = (final_loss, lengthscale_raw.detach().clone(), sigma_raw.detach().clone())
-
-    return best[1], best[2], best[0]
-
-
-def fit_density_matern_kernel(
-    y_train,
-    eigenvalues,
-    train_eigenvectors,
-    noise_var,
-    train_amp=None,
+    eigenvectors,
+    *,
+    kind,
+    amplitude=None,
+    spectral_raw_inits=(0.0,),
+    sigma_raw_inits=(0.0,),
+    steps=300,
+    lr=0.1,
     alpha=1.5,
-    kappa_inits=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0),
-    sigma_inits=(-1.0, 0.0, 1.0),
-    steps=350,
-    lr=0.05,
-    normalize=True,
 ):
-    best = None
+    """Fit a low-rank density GP without constructing the full grid kernel."""
+    train_grid_indices = canonicalize_inputs(
+        train_grid_indices.to(dtype=y_train.dtype, device=y_train.device)
+    )
+    starts = tuple(product(spectral_raw_inits, sigma_raw_inits))
 
-    for kappa_init in kappa_inits:
-        for sigma_init in sigma_inits:
-            kappa_raw = torch.tensor(
-                kappa_init,
-                dtype=y_train.dtype,
-                device=y_train.device,
-                requires_grad=True,
-            )
-            sigma_raw = torch.tensor(
-                sigma_init,
-                dtype=y_train.dtype,
-                device=y_train.device,
-                requires_grad=True,
-            )
-            opt = torch.optim.Adam([kappa_raw, sigma_raw], lr=lr)
+    def model_factory(start):
+        spectral_raw, sigma_raw = start
+        covariance_module = build_grid_density_kernel(
+            kind,
+            eigenvalues,
+            eigenvectors,
+            amplitude=amplitude,
+            alpha=alpha,
+        ).to(dtype=y_train.dtype, device=y_train.device)
+        spectral_value = F.softplus(
+            torch.as_tensor(spectral_raw, dtype=y_train.dtype, device=y_train.device)
+        )
+        if kind.lower() == "heat":
+            covariance_module.base_kernel.tau = spectral_value
+        elif kind.lower() == "matern":
+            covariance_module.base_kernel.kappa = spectral_value
+        else:
+            raise ValueError(f"Unsupported density spectral kernel: {kind!r}")
+        covariance_module.outputscale = F.softplus(
+            torch.as_tensor(sigma_raw, dtype=y_train.dtype, device=y_train.device)
+        ).square()
+        likelihood = fixed_noise_likelihood(y_train, noise_var)
+        return ExactGPModel(train_grid_indices, y_train, likelihood, covariance_module)
 
-            for _ in range(steps):
-                opt.zero_grad()
-                kernel = density_matern_kernel(
-                    kappa_raw,
-                    sigma_raw,
-                    eigenvalues,
-                    train_eigenvectors,
-                    train_amp,
-                    alpha=alpha,
-                    normalize=normalize,
-                )
-                loss = neg_mll_loss(y_train, kernel, noise_var)
-                loss.backward()
-                opt.step()
-
-            with torch.no_grad():
-                kernel = density_matern_kernel(
-                    kappa_raw,
-                    sigma_raw,
-                    eigenvalues,
-                    train_eigenvectors,
-                    train_amp,
-                    alpha=alpha,
-                    normalize=normalize,
-                )
-                final_loss = float(neg_mll_loss(y_train, kernel, noise_var).cpu())
-
-            if best is None or final_loss < best[0]:
-                best = (final_loss, kappa_raw.detach().clone(), sigma_raw.detach().clone())
-
-    return best[1], best[2], best[0]
-
-
-def fit_rbf_kernel_2d(
-    y_train,
-    x_train,
-    noise_var,
-    lengthscale_inits=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0),
-    sigma_inits=(-1.0, 0.0, 1.0),
-    steps=350,
-    lr=0.05,
-):
-    best = None
-
-    for lengthscale_init in lengthscale_inits:
-        for sigma_init in sigma_inits:
-            lengthscale_raw = torch.tensor(
-                lengthscale_init,
-                dtype=y_train.dtype,
-                device=y_train.device,
-                requires_grad=True,
-            )
-            sigma_raw = torch.tensor(
-                sigma_init,
-                dtype=y_train.dtype,
-                device=y_train.device,
-                requires_grad=True,
-            )
-            opt = torch.optim.Adam([lengthscale_raw, sigma_raw], lr=lr)
-
-            for _ in range(steps):
-                opt.zero_grad()
-                kernel = rbf_kernel_2d(lengthscale_raw, sigma_raw, x_train)
-                loss = neg_mll_loss(y_train, kernel, noise_var)
-                loss.backward()
-                opt.step()
-
-            with torch.no_grad():
-                kernel = rbf_kernel_2d(lengthscale_raw, sigma_raw, x_train)
-                final_loss = float(neg_mll_loss(y_train, kernel, noise_var).cpu())
-
-            if best is None or final_loss < best[0]:
-                best = (final_loss, lengthscale_raw.detach().clone(), sigma_raw.detach().clone())
-
-    return best[1], best[2], best[0]
+    return fit_exact_gp_multistart(model_factory, starts, steps=steps, lr=lr)

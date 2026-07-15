@@ -4,14 +4,13 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from src.fem import weighted_laplacian_eigendecomposition_2d
-from src.gp import gp_posterior
+from src.gp import dense_prior_covariance, predict_exact_gp
 from src.grid import gradient_norm, image, make_grid, nearest_grid_index
-from src.kernels import density_matern_kernel, kernel_to_correlation, rbf_kernel_2d
+from src.kernels import kernel_to_correlation
 from src.metrics import average_pair_correlation, evaluate_predictions
-from src.training import fit_density_matern_kernel, fit_rbf_kernel_2d
+from src.training import fit_density_gp, fit_euclidean_gp
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -279,24 +278,43 @@ def main():
     noise_var = 0.04**2
     y_train = f_true[idx_train] + math.sqrt(noise_var) * torch.randn(len(idx_train), dtype=dtype, device=device)
 
-    kappa_raw, sigma_density_raw, density_loss = fit_density_matern_kernel(
-        y_train,
-        eigenvalues,
-        eigenvectors[idx_train],
-        noise_var,
+    grid_indices = torch.arange(len(points), dtype=dtype, device=device).unsqueeze(-1)
+    density_fit = fit_density_gp(
+        y_train=y_train,
+        train_grid_indices=idx_train,
+        noise_var=noise_var,
+        eigenvalues=eigenvalues,
+        eigenvectors=eigenvectors,
+        kind="matern",
+        spectral_raw_inits=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0),
+        sigma_raw_inits=(-1.0, 0.0, 1.0),
+        steps=350,
+        lr=0.05,
+        alpha=MATERN_ALPHA,
     )
-    lengthscale_raw, sigma_rbf_raw, rbf_loss = fit_rbf_kernel_2d(
-        y_train,
-        points[idx_train],
-        noise_var,
+    rbf_fit = fit_euclidean_gp(
+        y_train=y_train,
+        x_train=points[idx_train],
+        noise_var=noise_var,
+        kind="rbf",
+        lengthscale_raw_inits=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0),
+        sigma_raw_inits=(-1.0, 0.0, 1.0),
+        steps=350,
+        lr=0.05,
     )
+
+    density_model = density_fit.model
+    rbf_model = rbf_fit.model
+    density_prediction = predict_exact_gp(density_model, grid_indices, noise_var)
+    rbf_prediction = predict_exact_gp(rbf_model, points, noise_var)
+    kernel_density = dense_prior_covariance(density_model, grid_indices)
+    kernel_rbf = dense_prior_covariance(rbf_model, points)
 
     with torch.no_grad():
-        kernel_density = density_matern_kernel(kappa_raw, sigma_density_raw, eigenvalues, eigenvectors)
-        kernel_rbf = rbf_kernel_2d(lengthscale_raw, sigma_rbf_raw, points)
-
-        mean_density, var_density = gp_posterior(kernel_density, idx_train, y_train, noise_var)
-        mean_rbf, var_rbf = gp_posterior(kernel_rbf, idx_train, y_train, noise_var)
+        mean_density = density_prediction.latent_mean
+        var_density = density_prediction.latent_variance
+        mean_rbf = rbf_prediction.latent_mean
+        var_rbf = rbf_prediction.latent_variance
 
         corr_density = kernel_to_correlation(kernel_density)
         corr_rbf = kernel_to_correlation(kernel_rbf)
@@ -309,12 +327,12 @@ def main():
 
         diagnostics = {
             "density_alpha": MATERN_ALPHA,
-            "density_kappa": float(F.softplus(kappa_raw).cpu()),
-            "density_sigma": float(F.softplus(sigma_density_raw).cpu()),
-            "density_loss": density_loss,
-            "rbf_lengthscale": float(F.softplus(lengthscale_raw).cpu()),
-            "rbf_sigma": float(F.softplus(sigma_rbf_raw).cpu()),
-            "rbf_loss": rbf_loss,
+            "density_kappa": float(density_model.covar_module.base_kernel.kappa.cpu()),
+            "density_sigma": float(density_model.covar_module.outputscale.sqrt().cpu()),
+            "density_loss": density_fit.total_negative_mll,
+            "rbf_lengthscale": float(rbf_model.covar_module.base_kernel.lengthscale.cpu()),
+            "rbf_sigma": float(rbf_model.covar_module.outputscale.sqrt().cpu()),
+            "rbf_loss": rbf_fit.total_negative_mll,
             "density_min": float(p_vals.min()),
             "density_max": float(p_vals.max()),
             "density_wall_corr": float(average_pair_correlation(corr_density, wall_pairs).cpu()),
@@ -329,8 +347,18 @@ def main():
             "density_grad_rooms": float(grad_density[regions["rooms"]].mean().cpu()),
             "rbf_grad_rooms": float(grad_rbf[regions["rooms"]].mean().cpu()),
             "true_grad_rooms": float(grad_true[regions["rooms"]].mean().cpu()),
-            "density": evaluate_predictions(f_true, mean_density, var_density + noise_var, regions),
-            "rbf": evaluate_predictions(f_true, mean_rbf, var_rbf + noise_var, regions),
+            "density": evaluate_predictions(
+                f_true,
+                mean_density,
+                density_prediction.observed_variance,
+                regions,
+            ),
+            "rbf": evaluate_predictions(
+                f_true,
+                mean_rbf,
+                rbf_prediction.observed_variance,
+                regions,
+            ),
         }
 
     output_path = Path(__file__).resolve().parent / "figs" / "example_wall_doorway.png"

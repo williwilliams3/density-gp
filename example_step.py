@@ -3,19 +3,16 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
-import torch.nn.functional as F
 
 from src.densities import build_notched_gaussian_density, sample_notched_gaussian_density
 from src.fem import weighted_laplacian_eigendecomposition
-from src.gp import gp_posterior
+from src.gp import dense_prior_covariance, predict_exact_gp
 from src.kernels import (
     density_amplitude,
-    density_heat_kernel,
     heat_kernel_weights,
     kernel_to_correlation,
-    rbf_kernel,
 )
-from src.training import fit_density_heat_kernel, fit_rbf_kernel
+from src.training import fit_density_gp, fit_euclidean_gp
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -180,53 +177,61 @@ def main():
         weights = heat_kernel_weights(initial_tau_raw, eigenvalues)
         print("first heat-kernel weights:", weights[:10].cpu().numpy())
 
-    tau_raw, sigma_density_raw = fit_density_heat_kernel(
+    grid_indices = torch.arange(len(x_grid), dtype=dtype, device=device).unsqueeze(-1)
+    density_fit = fit_density_gp(
         y_train=y_train,
-        eigenvalues=eigenvalues,
-        train_eigenvectors=eigenvectors[idx_train],
-        train_amp=amp_vals[idx_train],
+        train_grid_indices=idx_train,
         noise_var=noise_var,
+        eigenvalues=eigenvalues,
+        eigenvectors=eigenvectors,
+        kind="heat",
+        amplitude=amp_vals,
+        spectral_raw_inits=(0.0,),
+        sigma_raw_inits=(0.0,),
         steps=300,
         lr=0.1,
     )
-    lengthscale_raw, sigma_rbf_raw = fit_rbf_kernel(
+    rbf_fit = fit_euclidean_gp(
         y_train=y_train,
         x_train=x_train,
         noise_var=noise_var,
+        kind="rbf",
+        lengthscale_raw_inits=(0.0,),
+        sigma_raw_inits=(0.0,),
         steps=300,
         lr=0.1,
     )
 
-    with torch.no_grad():
-        kernel_density = density_heat_kernel(
-            tau_raw,
-            sigma_density_raw,
-            eigenvalues,
-            eigenvectors,
-            amp_vals,
-        )
-        kernel_rbf = rbf_kernel(lengthscale_raw, sigma_rbf_raw, x_grid)
+    density_model = density_fit.model
+    rbf_model = rbf_fit.model
+    density_prediction = predict_exact_gp(density_model, grid_indices, noise_var)
+    rbf_prediction = predict_exact_gp(rbf_model, x_grid, noise_var)
+    kernel_density = dense_prior_covariance(density_model, grid_indices)
+    kernel_rbf = dense_prior_covariance(rbf_model, x_grid)
 
+    with torch.no_grad():
         corr_density = kernel_to_correlation(kernel_density)
         corr_rbf = kernel_to_correlation(kernel_rbf)
 
-        mu_density, var_density = gp_posterior(kernel_density, idx_train, y_train, noise_var)
-        mu_rbf, var_rbf = gp_posterior(kernel_rbf, idx_train, y_train, noise_var)
+        mu_density = density_prediction.latent_mean
+        var_density = density_prediction.latent_variance
+        mu_rbf = rbf_prediction.latent_mean
+        var_rbf = rbf_prediction.latent_variance
 
         idx_left_ref = torch.argmin(torch.abs(x_grid + 0.85))
         idx_right_ref = torch.argmin(torch.abs(x_grid - 0.85))
 
         print(
             "density GP tau:",
-            float(F.softplus(tau_raw).cpu()),
+            float(density_model.covar_module.base_kernel.tau.cpu()),
             "sigma:",
-            float(F.softplus(sigma_density_raw).cpu()),
+            float(density_model.covar_module.outputscale.sqrt().cpu()),
         )
         print(
             "RBF lengthscale:",
-            float(F.softplus(lengthscale_raw).cpu()),
+            float(rbf_model.covar_module.base_kernel.lengthscale.cpu()),
             "sigma:",
-            float(F.softplus(sigma_rbf_raw).cpu()),
+            float(rbf_model.covar_module.outputscale.sqrt().cpu()),
         )
 
     output_path = Path(__file__).resolve().parent / "figs" / "example_step.png"
