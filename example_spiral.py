@@ -1,3 +1,15 @@
+"""Compare FEM, KLAP, and SpIN on the weighted spiral Laplacian.
+
+The primary experiment learns KLAP and SpIN eigenfunctions from identical iid
+draws from the spiral density.  A weighted-grid regime is also provided as a
+controlled quadrature comparison.  The earlier augmented-Lagrangian neural
+subspace solver remains available with ``--include-subspace``.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
 import math
 from pathlib import Path
 
@@ -5,31 +17,29 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from src.eigensystems import (
+    EigensystemComparison,
+    compare_eigensystems,
+    normalize_eigenfunction_columns,
+)
 from src.fem import weighted_laplacian_eigendecomposition_2d
-from src.gp import (
-    dense_prior_covariance,
-    gaussian_nll,
-    marginal_nll,
-    predict_exact_gp,
+from src.gp import gaussian_nll, marginal_nll, predict_exact_gp
+from src.grid import make_grid, nearest_grid_index
+from src.klap_eigenfunctions import KlapConfig, fit_klap_eigenfunctions
+from src.metrics import evaluate_predictions
+from src.neural_eigenfunctions import (
+    NeuralEigenfunctionConfig,
+    fit_neural_eigenfunctions,
 )
-from src.grid import image, make_grid, nearest_grid_index
-from src.kernels import kernel_to_correlation
-from src.metrics import (
-    average_pair_correlation,
-    average_pair_distance,
-    average_pair_label_difference,
-    evaluate_predictions,
-)
+from src.spin_eigenfunctions import SpINConfig, fit_spin_eigenfunctions
 from src.training import fit_density_gp, fit_euclidean_gp
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-dtype = torch.float64
-torch.manual_seed(12)
-
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float64
 GRID_SIZE = 61
 DOMAIN_LIMIT = 2.05
-N_MODES = 180
+N_MODES = 7
 N_TRAIN = 34
 N_TEST = 120
 NOISE_SD = 0.035
@@ -42,24 +52,33 @@ DENSITY_FLOOR = 0.001
 TUBE_THRESHOLD = 0.20
 
 
-def make_spiral_curve(n_curve=2400):
+@dataclass
+class LearnedEigensystem:
+    name: str
+    eigenvalues: torch.Tensor
+    eigenfunctions: torch.Tensor
+    comparison: EigensystemComparison
+    condition_number: float
+    maximum_residual: float
+    fitting_time: float
+    extra: str = ""
+
+
+def make_spiral_curve(n_curve: int = 2400):
     t_max = 2.0 * math.pi * SPIRAL_TURNS
     t = np.linspace(0.0, t_max, n_curve)
     radius = R_OUTER - (R_OUTER - R_INNER) * t / t_max
     x = radius * np.cos(t)
     y = radius * np.sin(t)
-
     arclength = np.zeros_like(t)
-    arclength[1:] = np.cumsum(np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2))
-    arclength = arclength / arclength[-1]
-    return t, x, y, arclength
+    arclength[1:] = np.cumsum(np.hypot(np.diff(x), np.diff(y)))
+    return t, x, y, arclength / arclength[-1]
 
 
 def nearest_spiral_coordinates(points, curve_x, curve_y, curve_s, chunk_size=500):
-    curve = np.column_stack([curve_x, curve_y])
+    curve = np.column_stack((curve_x, curve_y))
     best_dist2 = np.full(len(points), np.inf)
     best_idx = np.zeros(len(points), dtype=int)
-
     for start in range(0, len(curve), chunk_size):
         curve_chunk = curve[start : start + chunk_size]
         dist2 = np.sum((points[:, None, :] - curve_chunk[None, :, :]) ** 2, axis=2)
@@ -68,7 +87,6 @@ def nearest_spiral_coordinates(points, curve_x, curve_y, curve_s, chunk_size=500
         update = local_dist2 < best_dist2
         best_dist2[update] = local_dist2[update]
         best_idx[update] = start + local_idx[update]
-
     return np.sqrt(best_dist2), best_idx, curve_s[best_idx]
 
 
@@ -77,464 +95,703 @@ def spiral_density(distance_to_spiral):
 
 
 def spiral_target(normalized_arclength):
-    # Smooth and strictly increasing along the spiral.
-    return 2.0 * normalized_arclength - 1.0 + 0.12 * np.sin(2.0 * math.pi * normalized_arclength)
+    return (
+        2.0 * normalized_arclength
+        - 1.0
+        + 0.12 * np.sin(2.0 * math.pi * normalized_arclength)
+    )
+
+
+def sample_spiral_density(n, curve_x, curve_y, curve_s, *, seed):
+    """Draw continuous iid samples by rejection from the bounded density."""
+
+    rng = np.random.default_rng(seed)
+    accepted = []
+    while sum(len(chunk) for chunk in accepted) < n:
+        remaining = n - sum(len(chunk) for chunk in accepted)
+        proposal_count = max(4096, 20 * remaining)
+        proposals = rng.uniform(
+            -DOMAIN_LIMIT, DOMAIN_LIMIT, size=(proposal_count, 2)
+        )
+        distance, _, _ = nearest_spiral_coordinates(
+            proposals, curve_x, curve_y, curve_s
+        )
+        probability = spiral_density(distance) / (1.0 + DENSITY_FLOOR)
+        chosen = proposals[rng.random(proposal_count) < probability]
+        if len(chosen):
+            accepted.append(chosen[:remaining])
+    return np.concatenate(accepted, axis=0)[:n]
 
 
 def choose_training_indices(points, curve_x, curve_y, curve_s, n_train=N_TRAIN):
     indices = []
     for target_s in np.linspace(0.035, 0.965, n_train):
         curve_idx = int(np.argmin(np.abs(curve_s - target_s)))
-        indices.append(nearest_grid_index(points, (curve_x[curve_idx], curve_y[curve_idx])))
-
-    # Multiple curve points can snap to the same grid point; preserve order and
-    # drop duplicates.
-    unique_indices = list(dict.fromkeys(indices))
-    return torch.tensor(unique_indices, dtype=torch.long, device=device)
+        indices.append(
+            nearest_grid_index(points, (curve_x[curve_idx], curve_y[curve_idx]))
+        )
+    return torch.tensor(
+        list(dict.fromkeys(indices)), dtype=torch.long, device=DEVICE
+    )
 
 
 def choose_test_indices(points, curve_x, curve_y, curve_s, idx_train, n_test=N_TEST):
     train_set = set(idx_train.detach().cpu().tolist())
     indices = []
-
     for target_s in np.linspace(0.015, 0.985, n_test * 2):
         curve_idx = int(np.argmin(np.abs(curve_s - target_s)))
-        grid_idx = nearest_grid_index(points, (curve_x[curve_idx], curve_y[curve_idx]))
+        grid_idx = nearest_grid_index(
+            points, (curve_x[curve_idx], curve_y[curve_idx])
+        )
         if grid_idx not in train_set and grid_idx not in indices:
             indices.append(grid_idx)
         if len(indices) == n_test:
             break
+    return torch.tensor(indices, dtype=torch.long, device=DEVICE)
 
-    return torch.tensor(indices, dtype=torch.long, device=device)
 
-
-def diagnostic_pairs(points, curve_t, curve_x, curve_y, curve_s):
-    t_max = curve_t[-1]
-
-    adjacent_turn_pairs = []
-    for t_ref in np.linspace(0.7 * math.pi, t_max - 2.7 * math.pi, 9):
-        idx_a = int(np.argmin(np.abs(curve_t - t_ref)))
-        idx_b = int(np.argmin(np.abs(curve_t - (t_ref + 2.0 * math.pi))))
-        adjacent_turn_pairs.append(
-            (
-                nearest_grid_index(points, (curve_x[idx_a], curve_y[idx_a])),
-                nearest_grid_index(points, (curve_x[idx_b], curve_y[idx_b])),
-            )
+def _method_configs(seed: int, quick: bool):
+    if quick:
+        klap = KlapConfig(
+            num_nonconstant_modes=N_MODES - 1,
+            num_centers=32,
+            bandwidth_candidates=(0.25, 0.40),
+            seed=seed,
         )
-
-    along_spiral_pairs = []
-    for s_ref in np.linspace(0.10, 0.87, 9):
-        idx_a = int(np.argmin(np.abs(curve_s - s_ref)))
-        idx_b = int(np.argmin(np.abs(curve_s - (s_ref + 0.025))))
-        along_spiral_pairs.append(
-            (
-                nearest_grid_index(points, (curve_x[idx_a], curve_y[idx_a])),
-                nearest_grid_index(points, (curve_x[idx_b], curve_y[idx_b])),
-            )
+        spin = SpINConfig(
+            num_nonconstant_modes=N_MODES - 1,
+            hidden_width=24,
+            hidden_layers=1,
+            fourier_frequencies=2,
+            steps=20,
+            batch_size=64,
+            learning_rate=1e-3,
+            gradient_clip=10.0,
+            seed=seed,
+            log_every=10,
         )
-
-    return adjacent_turn_pairs, along_spiral_pairs
-
-
-def masked_image(values, tube_mask, n=GRID_SIZE):
-    arr = values.detach().cpu().numpy().copy()
-    arr[~tube_mask] = np.nan
-    return arr.reshape(n, n)
+    else:
+        klap = KlapConfig(seed=seed)
+        spin = SpINConfig(seed=seed)
+    return klap, spin
 
 
-def plot_results(
+def fit_regime(
+    name,
+    reference_points,
+    reference_weights,
+    validation_points,
+    validation_weights,
+    evaluation_points,
+    evaluation_weights,
+    fem_eigenvalues,
+    fem_eigenfunctions,
     *,
-    output_path,
+    seed,
+    quick,
+    include_subspace,
+):
+    klap_config, spin_config = _method_configs(seed, quick)
+    print(f"\n[{name}] fitting KLAP")
+    klap_fit = fit_klap_eigenfunctions(
+        reference_points.to(dtype=torch.float64),
+        reference_weights.to(dtype=torch.float64),
+        klap_config,
+        validation_points=validation_points.to(dtype=torch.float64),
+        validation_probability_weights=validation_weights.to(dtype=torch.float64),
+        verbose=True,
+    )
+    with torch.no_grad():
+        klap_functions = klap_fit.system(
+            evaluation_points.to(dtype=torch.float64)
+        ).to(DTYPE)
+    klap_values = klap_fit.eigenvalues.to(DTYPE)
+    klap_comparison = compare_eigensystems(
+        fem_eigenvalues,
+        fem_eigenfunctions,
+        klap_values,
+        klap_functions,
+        evaluation_weights,
+    )
+    systems = {
+        "klap": LearnedEigensystem(
+            "KLAP",
+            klap_values,
+            klap_functions,
+            klap_comparison,
+            klap_fit.condition_number,
+            float(klap_fit.residuals.max().cpu()),
+            klap_fit.fitting_time,
+            f"sigma={klap_fit.bandwidth:.3f}, validation={klap_fit.validation_score:.3f}",
+        )
+    }
+
+    print(f"\n[{name}] fitting SpIN")
+    spin_fit = fit_spin_eigenfunctions(
+        reference_points,
+        reference_weights,
+        spin_config,
+        validation_points=validation_points,
+        validation_probability_weights=validation_weights,
+        verbose=True,
+    )
+    with torch.no_grad():
+        spin_functions = spin_fit.system(evaluation_points).to(DTYPE)
+    spin_values = spin_fit.eigenvalues.to(DTYPE)
+    spin_comparison = compare_eigensystems(
+        fem_eigenvalues,
+        fem_eigenfunctions,
+        spin_values,
+        spin_functions,
+        evaluation_weights,
+    )
+    systems["spin"] = LearnedEigensystem(
+        "SpIN",
+        spin_values,
+        spin_functions,
+        spin_comparison,
+        spin_fit.condition_number,
+        float(spin_fit.residuals.max().cpu()),
+        spin_fit.fitting_time,
+        f"posthoc offdiag={spin_fit.posthoc_offdiagonal_ratio:.3e}",
+    )
+
+    if include_subspace:
+        steps = 20 if quick else 2_500
+        subspace_config = NeuralEigenfunctionConfig(
+            num_nonconstant_modes=N_MODES - 1,
+            hidden_width=24 if quick else 96,
+            hidden_layers=1 if quick else 3,
+            fourier_frequencies=2 if quick else 4,
+            steps=steps,
+            batch_size=64 if quick else 1_024,
+            learning_rate=1e-3,
+            constraint_strength=50.0,
+            multiplier_update_every=max(10, steps // 5),
+            gradient_clip=10.0,
+            seed=seed,
+            log_every=max(10, steps // 5),
+        )
+        print(f"\n[{name}] fitting optional augmented-Lagrangian subspace")
+        subspace_fit = fit_neural_eigenfunctions(
+            reference_points.float(),
+            reference_weights.float(),
+            subspace_config,
+            validation_points=validation_points.float(),
+            validation_probability_weights=validation_weights.float(),
+            verbose=True,
+        )
+        with torch.no_grad():
+            functions = subspace_fit.system(evaluation_points.float()).to(DTYPE)
+        values = subspace_fit.eigenvalues.to(DTYPE)
+        comparison = compare_eigensystems(
+            fem_eigenvalues,
+            fem_eigenfunctions,
+            values,
+            functions,
+            evaluation_weights,
+        )
+        systems["subspace"] = LearnedEigensystem(
+            "subspace",
+            values,
+            functions,
+            comparison,
+            float(torch.linalg.cond(subspace_fit.mass_matrix).cpu()),
+            float("nan"),
+            float("nan"),
+            "secondary augmented-Lagrangian baseline",
+        )
+    return systems
+
+
+def print_eigensolver_table(regime_name, systems, fem_values):
+    print(f"\n{regime_name.capitalize()} eigensolver comparison")
+    header = (
+        f"{'method':<10} {'mean eig err':>12} {'min cosine':>12} "
+        f"{'proj err':>10} {'orth err':>10} {'heat err':>10} "
+        f"{'condition':>11} {'residual':>10} {'time(s)':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+    for system in systems.values():
+        c = system.comparison
+        print(
+            f"{system.name:<10} {c.mean_eigenvalue_relative_error:>12.4f} "
+            f"{c.minimum_principal_cosine:>12.4f} {c.projector_error:>10.4f} "
+            f"{c.mass_orthogonality_error:>10.2e} "
+            f"{c.heat_kernel_relative_error:>10.4f} "
+            f"{system.condition_number:>11.2e} {system.maximum_residual:>10.2e} "
+            f"{system.fitting_time:>9.2f}"
+        )
+        print(f"  {system.extra}")
+        for mode in range(1, N_MODES):
+            print(
+                f"    mode {mode}: lambda FEM={float(fem_values[mode]):.4f}, "
+                f"learned={float(system.eigenvalues[mode]):.4f}, "
+                f"rel.err={float(c.eigenvalue_relative_errors[mode - 1]):.4f}, "
+                f"|corr|={float(c.mode_correlations[mode - 1]):.4f}"
+            )
+    print(
+        "  diagnostic targets (informational): mean eig err < 0.25, "
+        "min cosine > 0.80, heat err < 0.30, orth err < 1e-4"
+    )
+
+
+def _fit_gp_models(y_train, idx_train, points, systems, fem_values, fem_functions, quick):
+    spectral_starts = (-2.0, 0.0, 2.0) if quick else (
+        -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0
+    )
+    sigma_starts = (0.0,) if quick else (-1.0, 0.0, 1.0)
+    length_starts = (-2.0, 0.0, 2.0) if quick else (
+        -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0
+    )
+    steps = 25 if quick else 300
+    eigenpairs = {
+        "fem": (fem_values, fem_functions),
+        "klap": (systems["klap"].eigenvalues, systems["klap"].eigenfunctions),
+        "spin": (systems["spin"].eigenvalues, systems["spin"].eigenfunctions),
+    }
+    fits = {}
+    for name, (values, functions) in eigenpairs.items():
+        fits[name] = fit_density_gp(
+            y_train=y_train,
+            train_grid_indices=idx_train,
+            noise_var=NOISE_SD**2,
+            eigenvalues=values,
+            eigenvectors=functions,
+            kind="heat",
+            spectral_raw_inits=spectral_starts,
+            sigma_raw_inits=sigma_starts,
+            steps=steps,
+            lr=0.05,
+        )
+    fits["rbf"] = fit_euclidean_gp(
+        y_train=y_train,
+        x_train=points[idx_train],
+        noise_var=NOISE_SD**2,
+        kind="rbf",
+        lengthscale_raw_inits=length_starts,
+        sigma_raw_inits=sigma_starts,
+        steps=steps,
+        lr=0.05,
+    )
+    return fits
+
+
+def evaluate_gp_models(fits, points, idx_test, y_true, masks):
+    grid_indices = torch.arange(
+        len(points), dtype=DTYPE, device=points.device
+    ).unsqueeze(1)
+    predictions = {}
+    test_predictions = {}
+    for name in ("fem", "klap", "spin"):
+        predictions[name] = predict_exact_gp(
+            fits[name].model, grid_indices, NOISE_SD**2
+        )
+        test_predictions[name] = predict_exact_gp(
+            fits[name].model,
+            grid_indices[idx_test],
+            NOISE_SD**2,
+            full_covariance=True,
+        )
+    predictions["rbf"] = predict_exact_gp(
+        fits["rbf"].model, points, NOISE_SD**2
+    )
+    test_predictions["rbf"] = predict_exact_gp(
+        fits["rbf"].model,
+        points[idx_test],
+        NOISE_SD**2,
+        full_covariance=True,
+    )
+
+    diagnostics = {}
+    y_test = y_true[idx_test]
+    for name in ("fem", "klap", "spin", "rbf"):
+        prediction = predictions[name]
+        test_prediction = test_predictions[name]
+        joint = gaussian_nll(
+            y_test,
+            test_prediction.latent_mean,
+            test_prediction.latent_covariance,
+            NOISE_SD**2,
+        )
+        marginal = marginal_nll(
+            y_test,
+            test_prediction.latent_mean,
+            test_prediction.latent_covariance,
+            NOISE_SD**2,
+        )
+        diagnostics[name] = {
+            "regions": evaluate_predictions(
+                y_true,
+                prediction.latent_mean,
+                prediction.observed_variance,
+                masks,
+            ),
+            "joint_nll_per_point": float((joint / len(idx_test)).cpu()),
+            "marginal_nll": float(marginal.cpu()),
+            "fit_loss": fits[name].total_negative_mll,
+        }
+        with torch.no_grad():
+            if name == "rbf":
+                diagnostics[name]["scale"] = float(
+                    fits[name].model.covar_module.base_kernel.lengthscale.cpu()
+                )
+            else:
+                diagnostics[name]["scale"] = float(
+                    fits[name].model.covar_module.base_kernel.tau.cpu()
+                )
+            diagnostics[name]["sigma"] = float(
+                fits[name].model.covar_module.outputscale.sqrt().cpu()
+            )
+    fem_mean = predictions["fem"].latent_mean
+    for name in ("klap", "spin", "rbf"):
+        diagnostics[name]["fem_mean_rmse"] = float(
+            torch.sqrt(
+                torch.mean(
+                    (predictions[name].latent_mean[masks["tube"]] - fem_mean[masks["tube"]]).square()
+                )
+            ).cpu()
+        )
+    return predictions, diagnostics
+
+
+def print_gp_table(diagnostics, n_test, regime_name):
+    print(f"\n{regime_name.capitalize()}-regime GP comparison")
+    header = (
+        f"{'model':<8} {'RMSE':>8} {'NLPD':>8} {'coverage':>9} "
+        f"{'joint NLL':>10} {'marg NLL':>10} {'scale':>9} {'sigma':>9} "
+        f"{'fit loss':>10} {'vs FEM':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+    for name in ("fem", "klap", "spin", "rbf"):
+        data = diagnostics[name]
+        tube = data["regions"]["tube"]
+        disagreement = data.get("fem_mean_rmse", 0.0)
+        print(
+            f"{name:<8} {tube['rmse']:>8.4f} {tube['nlpd']:>8.4f} "
+            f"{tube['coverage']:>9.3f} {data['joint_nll_per_point']:>10.4f} "
+            f"{data['marginal_nll']:>10.4f} {data['scale']:>9.4f} "
+            f"{data['sigma']:>9.4f} {data['fit_loss']:>10.3f} "
+            f"{disagreement:>9.4f}"
+        )
+    print(f"  explicit held-out test points: {n_test}")
+
+
+def _masked(values, mask):
+    result = values.detach().cpu().numpy().copy()
+    result[~mask] = np.nan
+    return result.reshape(GRID_SIZE, GRID_SIZE)
+
+
+def plot_eigenfunctions(
+    path,
+    x_axis,
+    y_axis,
+    mask,
+    weights,
+    fem_values,
+    fem_functions,
+    systems,
+):
+    extent = [x_axis.min(), x_axis.max(), y_axis.min(), y_axis.max()]
+    normalized_weights = weights / weights.sum()
+    fig, axes = plt.subplots(3, N_MODES - 1, figsize=(3.0 * (N_MODES - 1), 8.5))
+    rows = (
+        ("FEM", fem_values, fem_functions),
+        ("KLAP", systems["klap"].eigenvalues, systems["klap"].eigenfunctions),
+        ("SpIN", systems["spin"].eigenvalues, systems["spin"].eigenfunctions),
+    )
+    for column, mode in enumerate(range(1, N_MODES)):
+        reference = fem_functions[:, mode]
+        aligned = []
+        for name, values, functions in rows:
+            function = functions[:, mode]
+            if float(torch.sum(normalized_weights * reference * function)) < 0:
+                function = -function
+            aligned.append((name, values, function))
+        scale = max(float(item[2].abs().max().cpu()) for item in aligned)
+        for row, (name, values, function) in enumerate(aligned):
+            axes[row, column].imshow(
+                _masked(function, mask),
+                extent=extent,
+                origin="lower",
+                cmap="coolwarm",
+                vmin=-scale,
+                vmax=scale,
+                aspect="equal",
+            )
+            axes[row, column].set_title(
+                f"{name} mode {mode}\n$\\lambda$={float(values[mode]):.3f}"
+            )
+            axes[row, column].set_xticks([])
+            axes[row, column].set_yticks([])
+    fig.suptitle("Weighted-Laplacian eigenfunctions", fontsize=14)
+    fig.tight_layout()
+    path.parent.mkdir(exist_ok=True)
+    fig.savefig(path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_gp_results(
+    path,
     x_axis,
     y_axis,
     p_vals,
-    tube_mask_np,
-    curve_x,
-    curve_y,
-    points,
+    mask,
+    points_np,
     idx_train,
     y_true,
-    curve_s_plot,
-    curve_grid_indices,
-    nearest_s,
-    mean_density,
-    var_density,
-    mean_rbf,
-    var_rbf,
-    corr_density,
-    corr_rbf,
-    ref_idx,
+    curve_x,
+    curve_y,
+    curve_s,
+    predictions,
     diagnostics,
+    regime_name,
 ):
     extent = [x_axis.min(), x_axis.max(), y_axis.min(), y_axis.max()]
-    train_np = idx_train.detach().cpu().numpy()
-    train_points = points[train_np]
-
-    cmap_density = plt.get_cmap("viridis").copy()
-    cmap_coolwarm = plt.get_cmap("coolwarm").copy()
-    cmap_magma = plt.get_cmap("magma").copy()
-    for cmap in (cmap_density, cmap_coolwarm, cmap_magma):
-        cmap.set_bad("white")
-
-    vmin = float(y_true[tube_mask_np].min().cpu())
-    vmax = float(y_true[tube_mask_np].max().cpu())
-    err_diff = torch.abs(mean_rbf - y_true) - torch.abs(mean_density - y_true)
-    max_err = float(torch.nan_to_num(torch.abs(err_diff)).max().cpu())
-
-    fig, axs = plt.subplots(2, 4, figsize=(21, 10))
-    image_panels = [
-        (axs[0, 0], image(p_vals, GRID_SIZE), "ambient spiral density", cmap_density, None, None),
-        (axs[0, 1], masked_image(y_true, tube_mask_np), "true function on spiral tube", cmap_coolwarm, vmin, vmax),
-        (axs[0, 2], masked_image(mean_rbf, tube_mask_np), "RBF GP mean", cmap_coolwarm, vmin, vmax),
-        (axs[0, 3], masked_image(mean_density, tube_mask_np), "density GP mean", cmap_coolwarm, vmin, vmax),
-        (
-            axs[1, 0],
-            masked_image(corr_rbf[ref_idx], tube_mask_np),
-            "RBF corr from reference",
-            cmap_magma,
-            0.0,
-            1.0,
-        ),
-        (
-            axs[1, 1],
-            masked_image(corr_density[ref_idx], tube_mask_np),
-            "dGP corr from reference",
-            cmap_magma,
-            0.0,
-            1.0,
-        ),
-        (
-            axs[1, 2],
-            masked_image(err_diff, tube_mask_np),
-            "|error RBF| - |error dGP|",
-            cmap_coolwarm,
-            -max_err,
-            max_err,
-        ),
+    vmin = float(y_true[torch.as_tensor(mask, device=y_true.device)].min().cpu())
+    vmax = float(y_true[torch.as_tensor(mask, device=y_true.device)].max().cpu())
+    fig, axes = plt.subplots(2, 4, figsize=(21, 10))
+    panels = [
+        (axes[0, 0], p_vals.reshape(GRID_SIZE, GRID_SIZE), "spiral density", "viridis", None, None),
+        (axes[0, 1], _masked(y_true, mask), "true function", "coolwarm", vmin, vmax),
+        (axes[0, 2], _masked(predictions["fem"].latent_mean, mask), "FEM GP", "coolwarm", vmin, vmax),
+        (axes[0, 3], _masked(predictions["klap"].latent_mean, mask), "KLAP GP", "coolwarm", vmin, vmax),
+        (axes[1, 0], _masked(predictions["spin"].latent_mean, mask), "SpIN GP", "coolwarm", vmin, vmax),
+        (axes[1, 1], _masked(predictions["rbf"].latent_mean, mask), "Euclidean RBF GP", "coolwarm", vmin, vmax),
     ]
-
-    for ax, values, title, cmap, panel_vmin, panel_vmax in image_panels:
-        im = ax.imshow(
+    train_np = idx_train.detach().cpu().numpy()
+    for ax, values, title, cmap, panel_min, panel_max in panels:
+        image = ax.imshow(
             values,
             extent=extent,
             origin="lower",
             interpolation="nearest",
             cmap=cmap,
-            vmin=panel_vmin,
-            vmax=panel_vmax,
+            vmin=panel_min,
+            vmax=panel_max,
             aspect="equal",
         )
-        ax.plot(curve_x, curve_y, color="black", lw=0.7, alpha=0.45)
+        ax.plot(curve_x, curve_y, "k-", lw=0.6, alpha=0.45)
         ax.scatter(
-            train_points[:, 0],
-            train_points[:, 1],
+            points_np[train_np, 0],
+            points_np[train_np, 1],
             facecolors="none",
             edgecolors="black",
-            linewidths=1.1,
-            s=38,
-        )
-        ax.scatter(
-            points[ref_idx, 0],
-            points[ref_idx, 1],
-            marker="x",
-            s=90,
-            color="yellow",
-            linewidths=2.0,
+            s=30,
         )
         ax.set_title(title)
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
 
-    ax = axs[1, 3]
-    curve_idx_torch = torch.as_tensor(curve_grid_indices, dtype=torch.long, device=y_true.device)
-    ax.plot(curve_s_plot, y_true[curve_idx_torch].detach().cpu().numpy(), "k:", lw=2, label="true")
-    ax.plot(curve_s_plot, mean_rbf[curve_idx_torch].detach().cpu().numpy(), "r-", lw=1.8, label="RBF")
-    ax.plot(curve_s_plot, mean_density[curve_idx_torch].detach().cpu().numpy(), "b-", lw=1.8, label="dGP")
-    ax.scatter(
-        nearest_s[train_np],
-        y_true[idx_train].detach().cpu().numpy(),
-        facecolors="none",
-        edgecolors="black",
-        s=32,
-        zorder=5,
-        label="labels",
+    curve_slice = slice(None, None, 4)
+    curve_indices = torch.as_tensor(
+        [
+            nearest_grid_index(points_np, (x, y))
+            for x, y in zip(curve_x[curve_slice], curve_y[curve_slice])
+        ],
+        dtype=torch.long,
+        device=y_true.device,
     )
-    ax.set_title("posterior along spiral arclength")
+    ax = axes[1, 2]
+    ax.plot(curve_s[curve_slice], y_true[curve_indices].cpu(), "k:", lw=2, label="truth")
+    styles = {"fem": "b-", "klap": "C1-", "spin": "C2--", "rbf": "r-"}
+    for name in ("fem", "klap", "spin", "rbf"):
+        ax.plot(
+            curve_s[curve_slice],
+            predictions[name].latent_mean[curve_indices].detach().cpu(),
+            styles[name],
+            lw=1.6,
+            label=name.upper(),
+        )
+    ax.set_title("posterior means along arclength")
     ax.set_xlabel("normalized arclength")
     ax.set_ylabel("f")
-    ax.legend(loc="best", fontsize=9)
+    ax.legend(fontsize=8)
 
-    summary = (
-        f"tube RMSE: RBF={diagnostics['rbf']['tube']['rmse']:.3f}, "
-        f"dGP={diagnostics['density']['tube']['rmse']:.3f}\n"
-        f"inner RMSE: RBF={diagnostics['rbf']['inner']['rmse']:.3f}, "
-        f"dGP={diagnostics['density']['inner']['rmse']:.3f}\n"
-        f"outer RMSE: RBF={diagnostics['rbf']['outer']['rmse']:.3f}, "
-        f"dGP={diagnostics['density']['outer']['rmse']:.3f}\n"
-        f"corr along/cross: RBF={diagnostics['rbf_corr_ratio']:.3f}, "
-        f"dGP={diagnostics['density_corr_ratio']:.3f}"
-    )
-    axs[1, 2].text(
-        0.03,
-        0.97,
-        summary,
-        transform=axs[1, 2].transAxes,
-        va="top",
-        ha="left",
-        fontsize=9,
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
-    )
-
-    plt.tight_layout()
-    output_path = Path(output_path)
-    output_path.parent.mkdir(exist_ok=True)
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    axes[1, 3].axis("off")
+    summary = [f"{regime_name.capitalize()}-regime tube diagnostics"]
+    for name in ("fem", "klap", "spin", "rbf"):
+        tube = diagnostics[name]["regions"]["tube"]
+        summary.append(
+            f"{name.upper():4s}: RMSE {tube['rmse']:.3f}, "
+            f"NLPD {tube['nlpd']:.3f}, coverage {tube['coverage']:.2f}"
+        )
+    axes[1, 3].text(0.02, 0.95, "\n".join(summary), va="top", fontsize=11)
+    fig.tight_layout()
+    path.parent.mkdir(exist_ok=True)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
-def print_diagnostics(diagnostics):
-    print("\nHyperparameters")
-    print(
-        f"  dGP heat tau={diagnostics['density_tau']:.4f}, "
-        f"sigma={diagnostics['density_sigma']:.4f}, loss={diagnostics['density_loss']:.4f}"
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--regime", choices=("quadrature", "sampled", "both"), default="both"
     )
-    print(
-        f"  RBF lengthscale={diagnostics['rbf_lengthscale']:.4f}, "
-        f"sigma={diagnostics['rbf_sigma']:.4f}, loss={diagnostics['rbf_loss']:.4f}"
+    parser.add_argument("--seed", type=int, default=12)
+    parser.add_argument(
+        "--include-subspace",
+        action="store_true",
+        help="also run the earlier augmented-Lagrangian neural baseline",
     )
-
-    print("\nGeometry diagnostics")
-    print(f"  density min={diagnostics['density_min']:.4f}, max={diagnostics['density_max']:.4f}")
-    print(f"  held-out tube points={diagnostics['n_tube_test']}")
-    print(
-        f"  adjacent-turn pairs: mean Euclidean distance={diagnostics['cross_turn_distance']:.4f}, "
-        f"mean label difference={diagnostics['cross_turn_label_diff']:.4f}"
+    parser.add_argument(
+        "--quick", action="store_true", help="use reduced smoke-test settings"
     )
-    print(
-        f"  along-spiral pairs:  mean Euclidean distance={diagnostics['along_distance']:.4f}, "
-        f"mean label difference={diagnostics['along_label_diff']:.4f}"
-    )
-    print(
-        f"  adjacent-turn corr: RBF={diagnostics['rbf_cross_turn_corr']:.4f}, "
-        f"dGP={diagnostics['density_cross_turn_corr']:.4f}"
-    )
-    print(
-        f"  along-spiral corr:  RBF={diagnostics['rbf_along_corr']:.4f}, "
-        f"dGP={diagnostics['density_along_corr']:.4f}"
-    )
-    print(
-        f"  along/cross corr ratio: RBF={diagnostics['rbf_corr_ratio']:.4f}, "
-        f"dGP={diagnostics['density_corr_ratio']:.4f}"
-    )
-    print("\nHeld-out test-set predictive NLL")
-    print(f"  n_test={diagnostics['n_explicit_test']}")
-    print(
-        f"  joint NLL:      RBF={diagnostics['rbf_test_joint_nll']:.4f}, "
-        f"dGP={diagnostics['density_test_joint_nll']:.4f}"
-    )
-    print(
-        f"  joint NLL / pt: RBF={diagnostics['rbf_test_joint_nll_per_point']:.4f}, "
-        f"dGP={diagnostics['density_test_joint_nll_per_point']:.4f}"
-    )
-    print(
-        f"  marginal NLL / pt: RBF={diagnostics['rbf_test_marginal_nll']:.4f}, "
-        f"dGP={diagnostics['density_test_marginal_nll']:.4f}"
-    )
-
-    print("\nDiagnostics on held-out spiral-tube grid points")
-    header = f"{'region':<10} {'model':<8} {'RMSE':>9} {'NLPD':>9} {'95% cov':>9}"
-    print(header)
-    print("-" * len(header))
-    for region in ("tube", "outer", "inner"):
-        for model in ("rbf", "density"):
-            vals = diagnostics[model][region]
-            print(f"{region:<10} {model:<8} {vals['rmse']:>9.4f} {vals['nlpd']:>9.4f} {vals['coverage']:>9.3f}")
+    return parser
 
 
-def main():
-    x_axis, y_axis, xx, yy, points_np = make_grid(GRID_SIZE, DOMAIN_LIMIT)
-    grid_spacing = x_axis[1] - x_axis[0]
-    curve_t, curve_x, curve_y, curve_s = make_spiral_curve()
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
-    distance_to_spiral, _, nearest_s = nearest_spiral_coordinates(points_np, curve_x, curve_y, curve_s)
-    p_vals = spiral_density(distance_to_spiral)
-    target_vals = spiral_target(nearest_s)
+    x_axis, y_axis, _, _, points_np = make_grid(GRID_SIZE, DOMAIN_LIMIT)
+    spacing = x_axis[1] - x_axis[0]
+    _, curve_x, curve_y, curve_s = make_spiral_curve()
+    distance, _, nearest_s = nearest_spiral_coordinates(
+        points_np, curve_x, curve_y, curve_s
+    )
+    p_vals = spiral_density(distance)
     tube_mask_np = p_vals > TUBE_THRESHOLD
+    points = torch.as_tensor(points_np, dtype=DTYPE, device=DEVICE)
+    grid_weights = torch.as_tensor(p_vals, dtype=DTYPE, device=DEVICE)
 
-    eigenvalues, eigenvectors = weighted_laplacian_eigendecomposition_2d(
+    print("Computing the fixed 61-by-61 FEM reference...")
+    fem_values, fem_functions = weighted_laplacian_eigendecomposition_2d(
         p_vals.reshape(GRID_SIZE, GRID_SIZE),
-        grid_spacing,
+        spacing,
         n_modes=N_MODES,
-        dtype=dtype,
-        device=device,
+        dtype=DTYPE,
+        device=DEVICE,
+    )
+    # SciPy normalizes against the unnormalized grid mass (including cell
+    # area). Convert to the probability convention shared by KLAP and SpIN.
+    fem_functions = normalize_eigenfunction_columns(
+        fem_functions, grid_weights, constant_mode=True
     )
 
-    points = torch.as_tensor(points_np, dtype=dtype, device=device)
-    y_true = torch.as_tensor(target_vals, dtype=dtype, device=device)
-    tube_mask = torch.as_tensor(tube_mask_np, dtype=torch.bool, device=device)
-    inner_mask = torch.as_tensor(tube_mask_np & (nearest_s > 0.62), dtype=torch.bool, device=device)
-    outer_mask = torch.as_tensor(tube_mask_np & (nearest_s < 0.38), dtype=torch.bool, device=device)
+    validation_x = 0.5 * (x_axis[:-1] + x_axis[1:])
+    validation_y = 0.5 * (y_axis[:-1] + y_axis[1:])
+    validation_xx, validation_yy = np.meshgrid(validation_x, validation_y, indexing="xy")
+    grid_validation_np = np.column_stack((validation_xx.ravel(), validation_yy.ravel()))
+    validation_distance, _, _ = nearest_spiral_coordinates(
+        grid_validation_np, curve_x, curve_y, curve_s
+    )
+    grid_validation_weights = torch.as_tensor(
+        spiral_density(validation_distance), dtype=DTYPE, device=DEVICE
+    )
+    grid_validation = torch.as_tensor(
+        grid_validation_np, dtype=DTYPE, device=DEVICE
+    )
 
+    regimes = {}
+    if args.regime in ("quadrature", "both"):
+        regimes["quadrature"] = fit_regime(
+            "quadrature",
+            points,
+            grid_weights,
+            grid_validation,
+            grid_validation_weights,
+            points,
+            grid_weights,
+            fem_values,
+            fem_functions,
+            seed=args.seed,
+            quick=args.quick,
+            include_subspace=args.include_subspace,
+        )
+        print_eigensolver_table("quadrature", regimes["quadrature"], fem_values)
+
+    if args.regime in ("sampled", "both"):
+        sample_count = 256 if args.quick else 4_096
+        reference_np = sample_spiral_density(
+            sample_count, curve_x, curve_y, curve_s, seed=args.seed
+        )
+        validation_np = sample_spiral_density(
+            sample_count, curve_x, curve_y, curve_s, seed=args.seed + 1
+        )
+        reference = torch.as_tensor(reference_np, dtype=DTYPE, device=DEVICE)
+        validation = torch.as_tensor(validation_np, dtype=DTYPE, device=DEVICE)
+        uniform = torch.ones(sample_count, dtype=DTYPE, device=DEVICE)
+        regimes["sampled"] = fit_regime(
+            "sampled",
+            reference,
+            uniform,
+            validation,
+            uniform,
+            points,
+            grid_weights,
+            fem_values,
+            fem_functions,
+            seed=args.seed,
+            quick=args.quick,
+            include_subspace=args.include_subspace,
+        )
+        print_eigensolver_table("sampled", regimes["sampled"], fem_values)
+
+    primary_name = "sampled" if "sampled" in regimes else "quadrature"
+    primary = regimes[primary_name]
+    y_true = torch.as_tensor(spiral_target(nearest_s), dtype=DTYPE, device=DEVICE)
+    tube_mask = torch.as_tensor(tube_mask_np, dtype=torch.bool, device=DEVICE)
     idx_train = choose_training_indices(points_np, curve_x, curve_y, curve_s)
     idx_test = choose_test_indices(points_np, curve_x, curve_y, curve_s, idx_train)
-    train_mask = torch.zeros(len(points_np), dtype=torch.bool, device=device)
+    train_mask = torch.zeros(len(points), dtype=torch.bool, device=DEVICE)
     train_mask[idx_train] = True
-    test_tube_mask = tube_mask & (~train_mask)
-
-    noise_var = NOISE_SD**2
-    y_train = y_true[idx_train] + NOISE_SD * torch.randn(len(idx_train), dtype=dtype, device=device)
-
-    grid_indices = torch.arange(len(points), dtype=dtype, device=device).unsqueeze(-1)
-    density_fit = fit_density_gp(
-        y_train=y_train,
-        train_grid_indices=idx_train,
-        noise_var=noise_var,
-        eigenvalues=eigenvalues,
-        eigenvectors=eigenvectors,
-        kind="heat",
-        spectral_raw_inits=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0),
-        sigma_raw_inits=(-1.0, 0.0, 1.0),
-        steps=300,
-        lr=0.05,
+    masks = {
+        "tube": tube_mask & ~train_mask,
+        "outer": tube_mask
+        & torch.as_tensor(nearest_s < 0.38, device=DEVICE)
+        & ~train_mask,
+        "inner": tube_mask
+        & torch.as_tensor(nearest_s > 0.62, device=DEVICE)
+        & ~train_mask,
+    }
+    noise_generator = torch.Generator(device=DEVICE).manual_seed(args.seed)
+    y_train = y_true[idx_train] + NOISE_SD * torch.randn(
+        len(idx_train), dtype=DTYPE, device=DEVICE, generator=noise_generator
     )
-    rbf_fit = fit_euclidean_gp(
-        y_train=y_train,
-        x_train=points[idx_train],
-        noise_var=noise_var,
-        kind="rbf",
-        lengthscale_raw_inits=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0),
-        sigma_raw_inits=(-1.0, 0.0, 1.0),
-        steps=300,
-        lr=0.05,
+    print("\nFitting matched seven-mode GPs...")
+    gp_fits = _fit_gp_models(
+        y_train, idx_train, points, primary, fem_values, fem_functions, args.quick
     )
-
-    density_model = density_fit.model
-    rbf_model = rbf_fit.model
-    density_prediction = predict_exact_gp(density_model, grid_indices, noise_var)
-    rbf_prediction = predict_exact_gp(rbf_model, points, noise_var)
-    density_test_prediction = predict_exact_gp(
-        density_model,
-        grid_indices[idx_test],
-        noise_var,
-        full_covariance=True,
+    predictions, gp_diagnostics = evaluate_gp_models(
+        gp_fits, points, idx_test, y_true, masks
     )
-    rbf_test_prediction = predict_exact_gp(
-        rbf_model,
-        points[idx_test],
-        noise_var,
-        full_covariance=True,
+    print_gp_table(gp_diagnostics, len(idx_test), primary_name)
+
+    figures = Path(__file__).resolve().parent / "figs"
+    eigen_path = figures / "example_spiral_eigenpairs.png"
+    gp_path = figures / "example_spiral.png"
+    plot_eigenfunctions(
+        eigen_path,
+        x_axis,
+        y_axis,
+        tube_mask_np,
+        grid_weights,
+        fem_values,
+        fem_functions,
+        primary,
     )
-    kernel_density = dense_prior_covariance(density_model, grid_indices)
-    kernel_rbf = dense_prior_covariance(rbf_model, points)
-
-    with torch.no_grad():
-        mean_density = density_prediction.latent_mean
-        var_density = density_prediction.latent_variance
-        mean_rbf = rbf_prediction.latent_mean
-        var_rbf = rbf_prediction.latent_variance
-        test_mean_density = density_test_prediction.latent_mean
-        test_cov_density = density_test_prediction.latent_covariance
-        test_mean_rbf = rbf_test_prediction.latent_mean
-        test_cov_rbf = rbf_test_prediction.latent_covariance
-        y_test = y_true[idx_test]
-        density_test_joint_nll = gaussian_nll(y_test, test_mean_density, test_cov_density, noise_var)
-        rbf_test_joint_nll = gaussian_nll(y_test, test_mean_rbf, test_cov_rbf, noise_var)
-        density_test_marginal_nll = marginal_nll(y_test, test_mean_density, test_cov_density, noise_var)
-        rbf_test_marginal_nll = marginal_nll(y_test, test_mean_rbf, test_cov_rbf, noise_var)
-
-        corr_density = kernel_to_correlation(kernel_density)
-        corr_rbf = kernel_to_correlation(kernel_rbf)
-
-        adjacent_turn_pairs, along_spiral_pairs = diagnostic_pairs(points_np, curve_t, curve_x, curve_y, curve_s)
-        density_cross_corr = float(average_pair_correlation(corr_density, adjacent_turn_pairs).cpu())
-        rbf_cross_corr = float(average_pair_correlation(corr_rbf, adjacent_turn_pairs).cpu())
-        density_along_corr = float(average_pair_correlation(corr_density, along_spiral_pairs).cpu())
-        rbf_along_corr = float(average_pair_correlation(corr_rbf, along_spiral_pairs).cpu())
-
-        masks = {
-            "tube": test_tube_mask,
-            "outer": outer_mask & (~train_mask),
-            "inner": inner_mask & (~train_mask),
-        }
-        ref_curve_idx = int(np.argmin(np.abs(curve_s - 0.53)))
-        ref_idx = nearest_grid_index(points_np, (curve_x[ref_curve_idx], curve_y[ref_curve_idx]))
-        curve_plot_slice = slice(None, None, 4)
-        curve_s_plot = curve_s[curve_plot_slice]
-        curve_grid_indices = np.array(
-            [
-                nearest_grid_index(points_np, (x_coord, y_coord))
-                for x_coord, y_coord in zip(curve_x[curve_plot_slice], curve_y[curve_plot_slice])
-            ]
-        )
-
-        diagnostics = {
-            "density_tau": float(density_model.covar_module.base_kernel.tau.cpu()),
-            "density_sigma": float(density_model.covar_module.outputscale.sqrt().cpu()),
-            "density_loss": density_fit.total_negative_mll,
-            "rbf_lengthscale": float(rbf_model.covar_module.base_kernel.lengthscale.cpu()),
-            "rbf_sigma": float(rbf_model.covar_module.outputscale.sqrt().cpu()),
-            "rbf_loss": rbf_fit.total_negative_mll,
-            "density_min": float(p_vals.min()),
-            "density_max": float(p_vals.max()),
-            "n_tube_test": int(test_tube_mask.sum().cpu()),
-            "cross_turn_distance": average_pair_distance(points_np, adjacent_turn_pairs),
-            "along_distance": average_pair_distance(points_np, along_spiral_pairs),
-            "cross_turn_label_diff": average_pair_label_difference(y_true, adjacent_turn_pairs),
-            "along_label_diff": average_pair_label_difference(y_true, along_spiral_pairs),
-            "density_cross_turn_corr": density_cross_corr,
-            "rbf_cross_turn_corr": rbf_cross_corr,
-            "density_along_corr": density_along_corr,
-            "rbf_along_corr": rbf_along_corr,
-            "density_corr_ratio": density_along_corr / density_cross_corr,
-            "rbf_corr_ratio": rbf_along_corr / rbf_cross_corr,
-            "n_explicit_test": int(len(idx_test)),
-            "density_test_joint_nll": float(density_test_joint_nll.cpu()),
-            "rbf_test_joint_nll": float(rbf_test_joint_nll.cpu()),
-            "density_test_joint_nll_per_point": float((density_test_joint_nll / len(idx_test)).cpu()),
-            "rbf_test_joint_nll_per_point": float((rbf_test_joint_nll / len(idx_test)).cpu()),
-            "density_test_marginal_nll": float(density_test_marginal_nll.cpu()),
-            "rbf_test_marginal_nll": float(rbf_test_marginal_nll.cpu()),
-            "density": evaluate_predictions(
-                y_true,
-                mean_density,
-                density_prediction.observed_variance,
-                masks,
-            ),
-            "rbf": evaluate_predictions(
-                y_true,
-                mean_rbf,
-                rbf_prediction.observed_variance,
-                masks,
-            ),
-        }
-
-    output_path = Path(__file__).resolve().parent / "figs" / "example_spiral.png"
-    plot_results(
-        output_path=output_path,
-        x_axis=x_axis,
-        y_axis=y_axis,
-        p_vals=p_vals,
-        tube_mask_np=tube_mask_np,
-        curve_x=curve_x,
-        curve_y=curve_y,
-        points=points_np,
-        idx_train=idx_train,
-        y_true=y_true,
-        curve_s_plot=curve_s_plot,
-        curve_grid_indices=curve_grid_indices,
-        nearest_s=nearest_s,
-        mean_density=mean_density,
-        var_density=var_density,
-        mean_rbf=mean_rbf,
-        var_rbf=var_rbf,
-        corr_density=corr_density,
-        corr_rbf=corr_rbf,
-        ref_idx=ref_idx,
-        diagnostics=diagnostics,
+    plot_gp_results(
+        gp_path,
+        x_axis,
+        y_axis,
+        p_vals,
+        tube_mask_np,
+        points_np,
+        idx_train,
+        y_true,
+        curve_x,
+        curve_y,
+        curve_s,
+        predictions,
+        gp_diagnostics,
+        primary_name,
     )
-    print_diagnostics(diagnostics)
-    print(f"\nSaved figure: {output_path}")
+    print(f"\nSaved primary GP figure: {gp_path}")
+    print(f"Saved eigenfunction figure: {eigen_path}")
 
 
 if __name__ == "__main__":
